@@ -1,428 +1,368 @@
 {
-  description = "3FS - File system for foundation models from deepseek-ai";
+  description = "Fire-Flyer File System (3FS) - High-performance distributed file system for AI workloads";
+
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
-  outputs = {
-    self,
-    nixpkgs,
-    flake-utils,
-  }:
-    flake-utils.lib.eachDefaultSystem (
-      system: let
-        pkgs = nixpkgs.legacyPackages.${system};
-      in {
-        packages.default = pkgs.stdenv.mkDerivation {
-          pname = "3FS";
-          version = "0.1.0";
-          src = pkgs.fetchFromGitHub {
-            owner = "deepseek-ai";
-            repo = "3fs"; # Lowercase is correct
-            rev = "f9a4291e693087946634432063aa2095f0aca45d";
-            sha256 = "sha256-RF+IlkxRbJNX6Gmu55OCYqoYkjWJ1lfUNsAhUmNUkcI=";
-            fetchSubmodules = true;
+
+  outputs = { self, nixpkgs, flake-utils }:
+    let
+      overlay = final: prev: {
+        # Build clickhouse-cpp from source if not available in nixpkgs
+        clickhouse-cpp = prev.clickhouse-cpp or (prev.stdenv.mkDerivation rec {
+          pname = "clickhouse-cpp";
+          version = "2.5.1";
+          
+          src = prev.fetchFromGitHub {
+            owner = "ClickHouse";
+            repo = "clickhouse-cpp";
+            rev = "v${version}";
+            sha256 = "sha256-6kqcANO4S9Z1ee4kBPKGCnsPEGDaWPCx2hUi4APPWHU=";
           };
-
-          nativeBuildInputs = with pkgs; [
-            git
-            cmake
-            ninja
-            pkg-config
-            clang_14
-            python3
-            rustc
-            cargo
-            rustfmt
-            clippy
+          
+          nativeBuildInputs = [ prev.cmake ];
+          buildInputs = [ prev.zlib prev.openssl prev.lz4 ];
+          
+          cmakeFlags = [
+            "-DBUILD_SHARED_LIBS=ON"
+            "-DWITH_OPENSSL=ON"
           ];
-
-          buildInputs = with pkgs; [
-            # Use boost 1.71 if available, otherwise fall back to another version
-            (
-              if pkgs.lib.hasAttr "boost171" pkgs
-              then boost171
-              else if pkgs.lib.hasAttr "boost172" pkgs
-              then boost172
-              else boost177
-            )
-            libuv
-            lz4
-            xz
-            double-conversion
-            libdwarf
-            libunwind
-            libaio
-            gflags
-            glog
-            gtest
-            lld_14
-            gperftools
-            openssl.dev
-            libevent
-            fmt
-
-            # Additional dependencies from README
-            fuse3
-            foundationdb
-
-            # Python dependencies
-            python3
-            python3Packages.pybind11
-
-            # Ensure we have the C++ runtime libraries
-            stdenv.cc.cc.lib
+        });
+        
+        # Build scnlib from source if not available in nixpkgs
+        scnlib = prev.scnlib or (prev.stdenv.mkDerivation rec {
+          pname = "scnlib";
+          version = "2.0.2";
+          
+          src = prev.fetchFromGitHub {
+            owner = "eliaskosunen";
+            repo = "scnlib";
+            rev = "v${version}";
+            sha256 = "sha256-YWlJiHAKKJd7jWv8Z0GmKqIfXI3HwVqA7AgZiHN2W8I=";
+          };
+          
+          nativeBuildInputs = [ prev.cmake ];
+          
+          cmakeFlags = [
+            "-DSCN_TESTS=OFF"
+            "-DSCN_EXAMPLES=OFF"
+            "-DSCN_BENCHMARKS=OFF"
           ];
-
-          # Helper function to get the appropriate Boost package
-          passthru.getBoost = pkgs:
-            if pkgs ? boost171
-            then pkgs.boost171
-            else if pkgs ? boost172
-            then pkgs.boost172
-            else pkgs.boost177;
-
-          preConfigure = ''
-            echo "Checking directory structure:"
-            find . -type f -name "*.sh" | sort
-
-            echo "Initializing git submodules manually:"
-            git config --global --add safe.directory "*"
-            git submodule update --init --recursive
-
-            echo "Applying patches using the project's patch script:"
-            if [ -f ./patches/apply.sh ]; then
-              chmod +x ./patches/apply.sh
-              ./patches/apply.sh
-              echo "Patches applied successfully"
-            else
-              echo "Warning: patches/apply.sh not found!"
-              find . -name "apply.sh" | while read patchfile; do
-                echo "Found potential patch script at: $patchfile"
-              done
-            fi
-
-            # Direct source code modification - the nuclear option
-            echo "Directly patching CMakeLists.txt files:"
-
-            # Find the main Boost find_package call and add our settings directly before it
-            # We'll add a print statement so we can see it in the logs
-            if grep -q "find_package(Boost" CMakeLists.txt; then
-              echo "Found Boost package call, applying direct patch..."
-              sed -i '/find_package(Boost/i # Force Boost settings - manually patched\nset(Boost_USE_STATIC_LIBS OFF CACHE BOOL "Use Boost static libs" FORCE)\nset(Boost_USE_SHARED_LIBS ON CACHE BOOL "Use Boost shared libs" FORCE)\nset(Boost_NO_BOOST_CMAKE OFF CACHE BOOL "Use Boost cmake" FORCE)\nmessage(STATUS "MANUALLY FORCING Boost_USE_STATIC_LIBS=OFF")' CMakeLists.txt
-            fi
-
-            # Patch all other files that might override our settings
-            find . -type f \( -name "*.cmake" -o -name "CMakeLists.txt" \) -exec grep -l "Boost_USE_STATIC_LIBS" {} \; | while read file; do
-              echo "Aggressive patching of $file"
-              sed -i 's/set(Boost_USE_STATIC_LIBS *ON)/set(Boost_USE_STATIC_LIBS OFF)/g' "$file"
-              sed -i 's/set(Boost_USE_STATIC_LIBS *TRUE)/set(Boost_USE_STATIC_LIBS FALSE)/g' "$file"
-              sed -i 's/Boost_USE_STATIC_LIBS *ON/Boost_USE_STATIC_LIBS OFF/g' "$file"
-              sed -i 's/Boost_USE_STATIC_LIBS *TRUE/Boost_USE_STATIC_LIBS FALSE/g' "$file"
-            done
-
-            # Create an initial cache file with our settings
-            cat > initial-cache.cmake << 'EOF'
-            set(Boost_USE_STATIC_LIBS OFF CACHE BOOL "Use Boost static libs" FORCE)
-            set(Boost_USE_SHARED_LIBS ON CACHE BOOL "Use Boost shared libs" FORCE)
-            set(Boost_USE_MULTITHREADED ON CACHE BOOL "Use Boost multithreaded libs" FORCE)
-            set(Boost_NO_BOOST_CMAKE OFF CACHE BOOL "Do not use Boost's own CMake" FORCE)
-            set(Boost_NO_SYSTEM_PATHS OFF CACHE BOOL "Do not search system for Boost" FORCE)
-            EOF
-
-            # Check our patching work
-            echo "Modified CMakeLists.txt content around Boost:"
-            grep -A 10 -B 10 "find_package(Boost" CMakeLists.txt || true
-          '';
-
-          # Clean up hooks we don't need
-          postPatch = "";
-          postFetch = "";
-
-          configurePhase = ''
-            # Define boost variable to make the script more readable
-            export BOOST_PKG="${
-              if pkgs ? boost171
-              then pkgs.boost171
-              else
-                (
-                  if pkgs ? boost172
-                  then pkgs.boost172
-                  else pkgs.boost177
-                )
-            }"
-
-            export PYTHONPATH=${pkgs.python3}/lib/python3.10/site-packages:${pkgs.python3Packages.pybind11}/lib/python3.10/site-packages
-
-            # Force shared libraries in the environment
-            export Boost_USE_STATIC_LIBS=OFF
-            export Boost_USE_SHARED_LIBS=ON
-            export Boost_NO_BOOST_CMAKE=OFF
-            export CMAKE_PREFIX_PATH=${pkgs.fmt}/lib/cmake/fmt
-
-            # Create symbolic links for Boost libs to help CMake find them
-            mkdir -p build/boost_libs
-            echo "Creating symlinks for Boost libraries from: $BOOST_PKG/lib"
-            for lib in $BOOST_PKG/lib/libboost_*.so*; do
-              echo "Linking $lib"
-              ln -sf $lib build/boost_libs/
-            done
-            export BOOST_LIBRARYDIR=$PWD/build/boost_libs
-
-            # Define the main CMake command with all our settings
-            echo "Running CMake configure..."
-            CMAKE_COMMAND="cmake -B build -S . -G Ninja \
-              -C initial-cache.cmake \
-              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-              -DCMAKE_INSTALL_PREFIX=$out \
-              -DCMAKE_CXX_COMPILER=${pkgs.clang_14}/bin/clang++ \
-              -DCMAKE_C_COMPILER=${pkgs.clang_14}/bin/clang \
-              -DPYTHON_EXECUTABLE=${pkgs.python3}/bin/python3 \
-              -DBoost_USE_STATIC_LIBS=OFF \
-              -DBoost_USE_SHARED_LIBS=ON \
-              -DBoost_NO_BOOST_CMAKE=OFF \
-              -DBOOST_ROOT=$BOOST_PKG \
-              -DBOOST_INCLUDEDIR=$BOOST_PKG/include \
-              -DBOOST_LIBRARYDIR=$BOOST_LIBRARYDIR \
-              -Dfmt_DIR=${pkgs.fmt}/lib/cmake/fmt"
-
-            echo "CMake command: $CMAKE_COMMAND"
-            eval "$CMAKE_COMMAND"
-
-            # Post-configure: Check and possibly modify the CMake cache
-            if [ -f build/CMakeCache.txt ]; then
-              echo "CMake cache exists. Checking Boost settings:"
-              grep -i "boost_.*static" build/CMakeCache.txt || echo "No Boost static settings found"
-
-              # Force-modify the cache if needed
-              if grep -q "Boost_USE_STATIC_LIBS:BOOL=ON" build/CMakeCache.txt; then
-                echo "WARNING: Cache still has Boost_USE_STATIC_LIBS=ON, manually fixing..."
-                sed -i 's/Boost_USE_STATIC_LIBS:BOOL=ON/Boost_USE_STATIC_LIBS:BOOL=OFF/g' build/CMakeCache.txt
-
-                # Re-run CMake to apply the modified cache
-                echo "Re-running CMake with patched cache..."
-                cmake -B build
-              fi
-            else
-              echo "ERROR: CMake cache not created!"
-            fi
-          '';
-
-          buildPhase = ''
-            echo "Building with $NIX_BUILD_CORES cores..."
-            cmake --build build -j $NIX_BUILD_CORES
-          '';
-
-          installPhase = ''
-            echo "Installing to $out..."
-            cmake --install build
-          '';
-
-          # Boost-related environment variables
-          BOOST_ROOT = let
-            boost =
-              if pkgs ? boost171
-              then pkgs.boost171
-              else
-                (
-                  if pkgs ? boost172
-                  then pkgs.boost172
-                  else pkgs.boost177
-                );
-          in "${boost}";
-          BOOST_INCLUDEDIR = let
-            boost =
-              if pkgs ? boost171
-              then pkgs.boost171
-              else
-                (
-                  if pkgs ? boost172
-                  then pkgs.boost172
-                  else pkgs.boost177
-                );
-          in "${boost}/include";
-          BOOST_LIBRARYDIR = let
-            boost =
-              if pkgs ? boost171
-              then pkgs.boost171
-              else
-                (
-                  if pkgs ? boost172
-                  then pkgs.boost172
-                  else pkgs.boost177
-                );
-          in "${boost}/lib";
-          Boost_USE_STATIC_LIBS = "OFF";
-          Boost_USE_SHARED_LIBS = "ON";
-          Boost_NO_BOOST_CMAKE = "OFF";
-
-          # Compiler settings
-          CC = "${pkgs.clang_14}/bin/clang";
-          CXX = "${pkgs.clang_14}/bin/clang++";
-          CMAKE_PREFIX_PATH = "${pkgs.fmt}/lib/cmake/fmt";
-
-          # Python settings
-          PYTHON_EXECUTABLE = "${pkgs.python3}/bin/python3";
-          PYTHONPATH = "${pkgs.python3}/lib/python3.10/site-packages:${pkgs.python3Packages.pybind11}/lib/python3.10/site-packages";
-
-          meta = with pkgs.lib; {
-            description = "3FS - File system for foundation models from deepseek-ai";
-            homepage = "https://github.com/deepseek-ai/3fs";
-            license = licenses.mit;
-            platforms = platforms.unix;
-            maintainers = [];
+        });
+        
+        "3fs" = prev.callPackage ./package.nix {
+          inherit (final) clickhouse-cpp scnlib;
+          libibverbs = prev.rdma-core;
+        };
+      };
+      
+      nixosModule = { config, lib, pkgs, ... }:
+        with lib;
+        let
+          cfg = config.services."3fs";
+          
+          # Helper function to create service configuration
+          mkServiceConfig = component: {
+            description = "3FS ${component} service";
+            wantedBy = [ "multi-user.target" ];
+            after = [ "network-online.target" ];
+            requires = [ "network-online.target" ];
+            
+            serviceConfig = {
+              Type = "simple";
+              ExecStart = "${pkgs."3fs"}/bin/${component}_main --launcher_cfg ${cfg.configDir}/${component}_main_launcher.toml --app-cfg ${cfg.configDir}/${component}_main_app.toml";
+              Restart = "on-failure";
+              RestartSec = 5;
+              LimitNOFILE = 1000000;
+              User = cfg.user;
+              Group = cfg.group;
+            } // (if component == "storage" then {
+              LimitMEMLOCK = "infinity";
+              TimeoutStopSec = "5m";
+            } else {});
+            
+            environment = {
+              LD_LIBRARY_PATH = "${pkgs."3fs"}/lib:${pkgs.foundationdb}/lib";
+            };
+          };
+        in
+        {
+          options.services."3fs" = {
+            enable = mkEnableOption "3FS distributed file system";
+            
+            user = mkOption {
+              type = types.str;
+              default = "threefs";
+              description = "User under which 3FS services run";
+            };
+            
+            group = mkOption {
+              type = types.str;
+              default = "threefs";
+              description = "Group under which 3FS services run";
+            };
+            
+            configDir = mkOption {
+              type = types.path;
+              default = "/etc/3fs";
+              description = "Directory containing 3FS configuration files";
+            };
+            
+            dataDir = mkOption {
+              type = types.path;
+              default = "/var/lib/3fs";
+              description = "Directory for 3FS data storage";
+            };
+            
+            meta = {
+              enable = mkEnableOption "3FS metadata service";
+              
+              config = mkOption {
+                type = types.attrs;
+                default = {};
+                description = "Additional configuration for meta service";
+              };
+            };
+            
+            storage = {
+              enable = mkEnableOption "3FS storage service";
+              
+              targets = mkOption {
+                type = types.listOf types.str;
+                default = [ "/var/lib/3fs/storage" ];
+                description = "List of storage target directories";
+              };
+              
+              config = mkOption {
+                type = types.attrs;
+                default = {};
+                description = "Additional configuration for storage service";
+              };
+            };
+            
+            mgmtd = {
+              enable = mkEnableOption "3FS management daemon";
+              
+              config = mkOption {
+                type = types.attrs;
+                default = {};
+                description = "Additional configuration for management daemon";
+              };
+            };
+            
+            monitor = {
+              enable = mkEnableOption "3FS monitor collector";
+              
+              config = mkOption {
+                type = types.attrs;
+                default = {};
+                description = "Additional configuration for monitor collector";
+              };
+            };
+            
+            fuse = {
+              enable = mkEnableOption "3FS FUSE client";
+              
+              mountPoint = mkOption {
+                type = types.path;
+                default = "/mnt/3fs";
+                description = "Mount point for 3FS FUSE filesystem";
+              };
+              
+              config = mkOption {
+                type = types.attrs;
+                default = {};
+                description = "Additional configuration for FUSE client";
+              };
+            };
+            
+            foundationdb = {
+              clusterFile = mkOption {
+                type = types.path;
+                default = "/etc/foundationdb/fdb.cluster";
+                description = "Path to FoundationDB cluster file";
+              };
+            };
+          };
+          
+          config = mkIf cfg.enable {
+            # Create system user and group
+            users.users.${cfg.user} = {
+              isSystemUser = true;
+              group = cfg.group;
+              home = cfg.dataDir;
+              createHome = true;
+              description = "3FS system user";
+            };
+            
+            users.groups.${cfg.group} = {};
+            
+            # Create necessary directories
+            systemd.tmpfiles.rules = [
+              "d '${cfg.configDir}' 0755 ${cfg.user} ${cfg.group} -"
+              "d '${cfg.dataDir}' 0755 ${cfg.user} ${cfg.group} -"
+              "d '${cfg.dataDir}/meta' 0755 ${cfg.user} ${cfg.group} -"
+              "d '${cfg.dataDir}/mgmtd' 0755 ${cfg.user} ${cfg.group} -"
+              "d '${cfg.dataDir}/monitor' 0755 ${cfg.user} ${cfg.group} -"
+            ] ++ (map (target: "d '${target}' 0755 ${cfg.user} ${cfg.group} -") cfg.storage.targets);
+            
+            # Install default configuration files
+            environment.etc = {
+              "3fs/meta_main_launcher.toml".source = "${pkgs."3fs"}/etc/3fs/meta_main_launcher.toml";
+              "3fs/meta_main_app.toml".source = "${pkgs."3fs"}/etc/3fs/meta_main_app.toml";
+              "3fs/storage_main_launcher.toml".source = "${pkgs."3fs"}/etc/3fs/storage_main_launcher.toml";
+              "3fs/storage_main_app.toml".source = "${pkgs."3fs"}/etc/3fs/storage_main_app.toml";
+              "3fs/mgmtd_main_launcher.toml".source = "${pkgs."3fs"}/etc/3fs/mgmtd_main_launcher.toml";
+              "3fs/mgmtd_main_app.toml".source = "${pkgs."3fs"}/etc/3fs/mgmtd_main_app.toml";
+              "3fs/monitor_collector_main.toml".source = "${pkgs."3fs"}/etc/3fs/monitor_collector_main.toml";
+              "3fs/hf3fs_fuse_main_launcher.toml".source = "${pkgs."3fs"}/etc/3fs/hf3fs_fuse_main_launcher.toml";
+              "3fs/hf3fs_fuse_main_app.toml".source = "${pkgs."3fs"}/etc/3fs/hf3fs_fuse_main_app.toml";
+            };
+            
+            # Define systemd services
+            systemd.services = {
+              "3fs-meta" = mkIf cfg.meta.enable (mkServiceConfig "meta");
+              "3fs-storage" = mkIf cfg.storage.enable (mkServiceConfig "storage");
+              "3fs-mgmtd" = mkIf cfg.mgmtd.enable (mkServiceConfig "mgmtd");
+              "3fs-monitor" = mkIf cfg.monitor.enable (mkServiceConfig "monitor_collector");
+              
+              "3fs-fuse" = mkIf cfg.fuse.enable {
+                description = "3FS FUSE client";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-online.target" "3fs-meta.service" ];
+                requires = [ "network-online.target" ];
+                
+                serviceConfig = {
+                  Type = "simple";
+                  ExecStart = "${pkgs."3fs"}/bin/hf3fs_fuse_main --launcher_cfg ${cfg.configDir}/hf3fs_fuse_main_launcher.toml --app-cfg ${cfg.configDir}/hf3fs_fuse_main_app.toml ${cfg.fuse.mountPoint}";
+                  ExecStop = "${pkgs.fuse3}/bin/fusermount3 -u ${cfg.fuse.mountPoint}";
+                  Restart = "on-failure";
+                  RestartSec = 5;
+                  LimitNOFILE = 1000000;
+                  User = "root";  # FUSE requires root
+                  Group = "root";
+                };
+                
+                preStart = ''
+                  mkdir -p ${cfg.fuse.mountPoint}
+                '';
+              };
+            };
+            
+            # Add 3fs package to system packages
+            environment.systemPackages = [ pkgs."3fs" ];
           };
         };
+    in
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ overlay ];
+        };
+        
+        isLinux = pkgs.stdenv.isLinux;
+      in
+      {
+        packages = pkgs.lib.optionalAttrs isLinux {
+          default = pkgs."3fs";
+          "3fs" = pkgs."3fs";
+        };
 
-        # Development shell with necessary dependencies
+        # Don't export overlays per-system
+
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            git
+          inputsFrom = pkgs.lib.optionals isLinux [ pkgs."3fs" ];
+          buildInputs = with pkgs; [
+            # Build dependencies that are cross-platform
             cmake
-            ninja
             pkg-config
-            clang_14
-            (
-              if pkgs.lib.hasAttr "boost171" pkgs
-              then boost171
-              else if pkgs.lib.hasAttr "boost172" pkgs
-              then boost172
-              else boost177
-            )
-            libuv
-            lz4
-            xz
-            double-conversion
-            libdwarf
-            libunwind
-            libaio
-            gflags
-            glog
+            boost
+            protobuf
+            grpc
             gtest
-            lld_14
-            gperftools
-            openssl.dev
+            glog
+            lz4
+            zlib
+            openssl
+            zstd
+            jemalloc
             libevent
+            thrift
+            bison
+            flex
+            git
+            which
             fmt
-
-            # Python
-            python3
-            python3Packages.pybind11
-
-            # Rust toolchain
+            folly
+            rocksdb
+            leveldb
+            arrow-cpp
+            mimalloc
+            tomlplusplus
             rustc
             cargo
             rustfmt
             clippy
-
-            # Additional dependencies from README
-            fuse3
+            rustPlatform.bindgenHook
+            clickhouse-cpp
+            scnlib
+            
+            # Additional dev tools
+            clang-tools_14
+            cmake-format
+            cmake-language-server
+            gdb
+            rust-analyzer
+            cargo-watch
+          ] ++ pkgs.lib.optionals isLinux [
+            # Linux-only dependencies
             foundationdb
+            fuse3
+            rdma-core
+            numactl
+            liburing
+            valgrind
+            perf-tools
           ];
-
-          # Boost environment settings
-          BOOST_ROOT = let
-            boost =
-              if pkgs ? boost171
-              then pkgs.boost171
-              else
-                (
-                  if pkgs ? boost172
-                  then pkgs.boost172
-                  else pkgs.boost177
-                );
-          in "${boost}";
-          BOOST_INCLUDEDIR = let
-            boost =
-              if pkgs ? boost171
-              then pkgs.boost171
-              else
-                (
-                  if pkgs ? boost172
-                  then pkgs.boost172
-                  else pkgs.boost177
-                );
-          in "${boost}/include";
-          BOOST_LIBRARYDIR = let
-            boost =
-              if pkgs ? boost171
-              then pkgs.boost171
-              else
-                (
-                  if pkgs ? boost172
-                  then pkgs.boost172
-                  else pkgs.boost177
-                );
-          in "${boost}/lib";
-          Boost_USE_STATIC_LIBS = "OFF";
-          Boost_USE_SHARED_LIBS = "ON";
-          Boost_NO_BOOST_CMAKE = "OFF";
-
-          # Python settings
-          PYTHON_EXECUTABLE = "${pkgs.python3}/bin/python3";
-          PYTHONPATH = "${pkgs.python3}/lib/python3.10/site-packages:${pkgs.python3Packages.pybind11}/lib/python3.10/site-packages";
-
-          # Compiler settings
-          CC = "${pkgs.clang_14}/bin/clang";
-          CXX = "${pkgs.clang_14}/bin/clang++";
-
+          
           shellHook = ''
-            echo "3FS development environment activated"
-            echo "Boost root: $BOOST_ROOT"
-            echo "Boost include dir: $BOOST_INCLUDEDIR"
-            echo "Boost library dir: $BOOST_LIBRARYDIR"
-            echo "Python executable: $PYTHON_EXECUTABLE"
-            echo "C compiler: $CC"
-            echo "C++ compiler: $CXX"
-
-            # Create compile_commands.json symlink for IDE integration
-            if [ -f build/compile_commands.json ]; then
-              ln -sf build/compile_commands.json compile_commands.json
-            fi
-
-            # Helper function to build in dev shell
-            function build3fs() {
-              echo "Building 3FS with dev shell settings..."
-
-              # Create a CMake initial cache file with our settings
-              cat > initial-cache.cmake << 'EOF'
-              set(Boost_USE_STATIC_LIBS OFF CACHE BOOL "Use Boost static libs" FORCE)
-              set(Boost_USE_SHARED_LIBS ON CACHE BOOL "Use Boost shared libs" FORCE)
-              set(Boost_USE_MULTITHREADED ON CACHE BOOL "Use Boost multithreaded libs" FORCE)
-              set(Boost_NO_BOOST_CMAKE OFF CACHE BOOL "Do not use Boost's own CMake" FORCE)
-              set(Boost_NO_SYSTEM_PATHS OFF CACHE BOOL "Do not search system for Boost" FORCE)
-              EOF
-
-              # Create symbolic links for Boost libs to help CMake find them
-              mkdir -p build/boost_libs
-              for lib in $BOOST_ROOT/lib/libboost_*.so*; do
-                ln -sf $lib build/boost_libs/
-              done
-              export BOOST_LIBRARYDIR=$PWD/build/boost_libs
-
-              # Run CMake with our settings
-              cmake -B build -S . -G Ninja \
-                -C initial-cache.cmake \
-                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-                -DCMAKE_CXX_COMPILER=$CXX \
-                -DCMAKE_C_COMPILER=$CC \
-                -DPYTHON_EXECUTABLE=$PYTHON_EXECUTABLE \
-                -DBoost_USE_STATIC_LIBS=OFF \
-                -DBoost_USE_SHARED_LIBS=ON \
-                -DBoost_NO_BOOST_CMAKE=OFF \
-                -DBOOST_ROOT=$BOOST_ROOT \
-                -DBOOST_INCLUDEDIR=$BOOST_INCLUDEDIR \
-                -DBOOST_LIBRARYDIR=$BOOST_LIBRARYDIR
-
-              # Build the project
-              cmake --build build -j $(nproc)
-            }
-
-            echo "Use 'build3fs' command to build the project"
+            echo "3FS development environment"
+            ${if isLinux then ''
+              echo "Build with: nix build .#3fs"
+            '' else ''
+              echo "Note: 3FS can only be built on Linux systems"
+            ''}
+            echo "Enter shell with: nix develop"
+            echo ""
+            echo "To test locally:"
+            echo "  1. Start FoundationDB"
+            echo "  2. Configure and start 3FS services"
+            echo "  3. Mount FUSE filesystem"
           '';
+        };
+        checks = pkgs.lib.optionalAttrs isLinux {
+          # Package build test
+          package = pkgs."3fs";
+        } // pkgs.lib.optionalAttrs isLinux {
+          # Integration test using NixOS VM (Linux only)
+          integration-test = pkgs.nixosTest (import ./nixos-module-test.nix {
+            inherit pkgs self;
+            lib = pkgs.lib;
+          });
         };
       }
-    );
+    ) // {
+      nixosModules.default = nixosModule;
+      nixosModules."3fs" = nixosModule;
+      
+      overlays.default = overlay;
+      
+      # Hydra job for CI - only for Linux systems
+      hydraJobs = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system: {
+        packages = self.packages.${system};
+        tests = self.checks.${system} or {};
+      });
+    };
 }
